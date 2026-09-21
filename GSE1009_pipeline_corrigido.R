@@ -3,19 +3,6 @@
 # Plataforma: Affymetrix HG-U95Av2 (GPL8300)
 # Versão CORRIGIDA e comentada do pipeline
 # =============================================================================
-# Mudanças principais em relação à versão original (justificativa completa no
-# documento de auditoria):
-#   (1) Bloco de debug gráfico removido.
-#   (2) Extração de metadados robusta + checagens que FALHAM em vez de seguir
-#       silenciosamente com NA.
-#   (3) Tratamento explícito das réplicas 1a/1b (não-independência das amostras).
-#   (4) Cortes de significância definidos UMA vez e reutilizados em todo lugar
-#       (limma, volcano, heatmap, venn, GO/KEGG).
-#   (5) unique() nas listas de genes e no universo do enriquecimento.
-#   (6) Guardas de NULL/vazio em todos os passos que podem não retornar nada.
-#   (7) Remoção de comandos redundantes.
-# =============================================================================
-
 
 # =============================================================================
 # 0. PARÂMETROS DA ANÁLISE (fonte única de verdade)
