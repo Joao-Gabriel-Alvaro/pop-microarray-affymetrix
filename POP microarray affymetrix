@@ -1,716 +1,201 @@
-# =============================================================================
-# GSE1009 — PIPELINE COMPLETO
-# Análise de expressão diferencial em microarray Affymetrix HG_U95Av2
-# =============================================================================
+# ==============================================================
+# POP Microarray - GSE1009 (Nefropatia diabética vs Controle)
+# Execute com o RStudio Project aberto na pasta Projeto_Microarray
+# ==============================================================
 
-# -----------------------------------------------------------------------------
-# 0. PACOTES
-# -----------------------------------------------------------------------------
+# 01. Pacotes ---------------------------------------------------
+# (instalação: rodar UMA vez, ver seção 5 do POP)
+install.packages(c("BiocManager", "ggplot2", "pheatmap"))
+BiocManager::install(c("GEOquery", "affy", "limma", "hgu95av2.db", "hgu95av2cdf",
+                        "AnnotationDbi", "clusterProfiler", "org.Hs.eg.db", "enrichplot"))
 
 library(GEOquery)
-library(oligo)
-library(pd.hg.u95av2)
+library(affy)
 library(limma)
-library(genefilter)
-library(ggplot2)
-library(AnnotationDbi)
 library(hgu95av2.db)
+library(AnnotationDbi)
 library(clusterProfiler)
 library(org.Hs.eg.db)
+library(enrichplot)
+library(ggplot2)
+library(pheatmap)
 
-# -----------------------------------------------------------------------------
-# 1. PASTAS
-# -----------------------------------------------------------------------------
+set.seed(123)
+options(timeout = 600)
 
-dir.create("resultados_GSE1009",
-           showWarnings = FALSE)
+# Parâmetros da análise (não alterar sem registrar no POP)
+fdr_corte <- 0.05   # FDR máximo
+lfc_corte <- 1      # |log2FC| mínimo
+n_heatmap <- 50     # nº máximo de genes no heatmap
 
-dir.create("resultados_GSE1009/figuras",
-           showWarnings = FALSE)
+# Pastas de saída
+for (p in c("01_Dados", "02_Scripts", "03_Resultados", "04_Figuras",
+            "05_Tabelas", "06_Documentacao")) dir.create(p, showWarnings = FALSE)
 
-dir.create("GSE1009/CEL_files",
-           recursive = TRUE,
-           showWarnings = FALSE)
-
-# -----------------------------------------------------------------------------
-# 2. DOWNLOAD DO GEO
-# -----------------------------------------------------------------------------
-
-getGEOSuppFiles(
-  "GSE1009",
-  makeDirectory = TRUE,
-  baseDir = getwd()
-)
-
-# -----------------------------------------------------------------------------
-# 3. EXTRAÇÃO DOS CEL
-# -----------------------------------------------------------------------------
-
-untar(
-  "GSE1009/GSE1009_RAW.tar",
-  exdir = "GSE1009/CEL_files"
-)
-
-# -----------------------------------------------------------------------------
-# 4. LOCALIZAR CEL
-# -----------------------------------------------------------------------------
-
-cel_files <- list.files(
-  "GSE1009/CEL_files",
-  pattern = "\\.CEL(\\.gz)?$",
-  full.names = TRUE,
-  ignore.case = TRUE
-)
-
-if (length(cel_files) != 6) {
-  stop(
-    paste(
-      "Esperados 6 arquivos CEL, encontrados:",
-      length(cel_files)
-    )
-  )
+# 02. Importação dos dados ---------------------------------------
+if (!file.exists("01_Dados/GSE1009/GSE1009_RAW.tar")) {
+  getGEOSuppFiles("GSE1009", baseDir = "01_Dados")
 }
+untar("01_Dados/GSE1009/GSE1009_RAW.tar", exdir = "01_Dados/GSE1009/CEL")
 
-# -----------------------------------------------------------------------------
-# 5. EXTRAIR GSM DOS NOMES DOS CEL
-# -----------------------------------------------------------------------------
+arquivos_cel <- list.files("01_Dados/GSE1009/CEL", pattern = "\\.CEL(\\.gz)?$",
+                           ignore.case = TRUE, full.names = TRUE, recursive = TRUE)
+if (length(arquivos_cel) != 6) stop("Esperados 6 arquivos .CEL; encontrados: ", length(arquivos_cel))
 
-extract_gsm <- function(x) {
+afy <- ReadAffy(filenames = arquivos_cel)
+sampleNames(afy) <- sub("[._].*$", "", sampleNames(afy))   # fica só o código GSM
 
-  nome <- basename(x)
+# 03. Organização dos grupos -------------------------------------
+gse  <- getGEO("GSE1009", GSEMatrix = TRUE, getGPL = FALSE)
+meta <- pData(phenoData(gse[[1]]))
+print(meta[, c("geo_accession", "title", "source_name_ch1")])
 
-  pos <- regexpr(
-    "GSM[0-9]+",
-    nome,
-    perl = TRUE
-  )
+# PREENCHER com os GSM lidos na tabela acima (CONFIRMAR ESTA INFORMAÇÃO NO GEO)
+gsm_controle <- c("GSM15965", "GSM15966", "GSM15967")
+gsm_DN       <- c("GSM15968", "GSM15969", "GSM15970")
 
-  if (pos[1] == -1) {
-    return(NA_character_)
-  }
+if (!setequal(c(gsm_controle, gsm_DN), sampleNames(afy)))
+  stop("Os GSM informados não batem com as amostras importadas. Revise gsm_controle e gsm_DN.")
 
-  regmatches(nome, pos)
-}
+info <- data.frame(amostra = sampleNames(afy), stringsAsFactors = FALSE)
+info$grupo <- factor(ifelse(info$amostra %in% gsm_DN, "DN", "Controle"),
+                     levels = c("Controle", "DN"))
+print(info)
+print(table(info$grupo))
 
-gsm_cel <- vapply(
-  cel_files,
-  extract_gsm,
-  character(1)
-)
+cores <- c(Controle = "#2C7BB6", DN = "#D7191C")
+cor_amostra <- cores[as.character(info$grupo)]
 
-if (anyNA(gsm_cel)) {
-  stop("Não foi possível identificar o GSM em pelo menos um arquivo CEL.")
-}
-
-# -----------------------------------------------------------------------------
-# 6. METADADOS GEO
-# -----------------------------------------------------------------------------
-
-gse <- getGEO(
-  "GSE1009",
-  GSEMatrix = TRUE
-)
-
-obj_gse <- gse[[1]]
-
-if (inherits(obj_gse, "ExpressionSet")) {
-
-  pheno <- Biobase::pData(obj_gse)
-
-} else if (inherits(obj_gse, "SummarizedExperiment")) {
-
-  pheno <- as.data.frame(
-    SummarizedExperiment::colData(obj_gse)
-  )
-
-} else {
-
-  stop("Tipo de objeto GEO não reconhecido.")
-}
-
-if (!"geo_accession" %in% colnames(pheno)) {
-  stop("A coluna geo_accession não foi encontrada.")
-}
-
-if (!"title" %in% colnames(pheno)) {
-  stop("A coluna title não foi encontrada.")
-}
-
-# -----------------------------------------------------------------------------
-# 7. REORDENAR METADADOS PELO GSM DOS CEL
-# -----------------------------------------------------------------------------
-
-idx <- match(
-  gsm_cel,
-  pheno$geo_accession
-)
-
-if (anyNA(idx)) {
-  stop(
-    "Existe pelo menos um CEL sem correspondência nos metadados."
-  )
-}
-
-pheno <- pheno[
-  idx,
-  ,
-  drop = FALSE
-]
-
-rownames(pheno) <- gsm_cel
-
-# -----------------------------------------------------------------------------
-# 8. DEFINIR GRUPOS
-# -----------------------------------------------------------------------------
-
-pheno$Grupo <- NA_character_
-
-pheno$Grupo[
-  grepl(
-    "^Control",
-    pheno$title,
-    ignore.case = TRUE
-  )
-] <- "Control"
-
-pheno$Grupo[
-  grepl(
-    "^Diabetes",
-    pheno$title,
-    ignore.case = TRUE
-  )
-] <- "DN"
-
-if (anyNA(pheno$Grupo)) {
-  stop(
-    "Pelo menos uma amostra não pôde ser classificada como Control ou DN."
-  )
-}
-
-# -----------------------------------------------------------------------------
-# 9. DEFINIR BLOCO / INDIVÍDUO
-# -----------------------------------------------------------------------------
-
-id_local <- sub(
-  "^(Control|Diabetes)[ _-]*",
-  "",
-  pheno$title,
-  ignore.case = TRUE
-)
-
-id_base <- sub(
-  "[ab]$",
-  "",
-  id_local,
-  ignore.case = TRUE
-)
-
-pheno$Individuo_Bloco <- paste(
-  pheno$Grupo,
-  id_base,
-  sep = "_"
-)
-
-# -----------------------------------------------------------------------------
-# 10. SALVAR METADADOS
-# -----------------------------------------------------------------------------
-
-write.csv(
-  pheno,
-  "resultados_GSE1009/metadados_utilizados.csv",
-  row.names = TRUE
-)
-
-# -----------------------------------------------------------------------------
-# 11. LER CEL
-# -----------------------------------------------------------------------------
-
-rawData <- read.celfiles(
-  filenames = cel_files,
-  verbose = TRUE
-)
-
-sampleNames(rawData) <- gsm_cel
-
-# -----------------------------------------------------------------------------
-# 12. BOXplot BRUTO
-# -----------------------------------------------------------------------------
-
-pdf(
-  "resultados_GSE1009/figuras/01_boxplot_bruto_log2.pdf",
-  width = 10,
-  height = 6
-)
-
-boxplot(
-  log2(exprs(rawData) + 1),
-  las = 2,
-  main = "GSE1009 - Dados brutos em escala log2",
-  ylab = "Intensidade log2",
-  outline = FALSE
-)
-
+# 04. Pré-processamento (RMA) -------------------------------------
+png("04_Figuras/01_boxplot_antes_RMA.png", width = 1600, height = 1200, res = 200)
+boxplot(afy, col = cor_amostra, las = 2,
+        main = "Antes da normalização (log2)", ylab = "log2(intensidade)")
 dev.off()
 
-# -----------------------------------------------------------------------------
-# 13. RMA
-# -----------------------------------------------------------------------------
+eset <- rma(afy)                 # background + normalização por quantis + resumo (RMA)
+expr_sondas <- exprs(eset)       # matriz sondas x amostras (log2)
 
-rmaData <- rma(rawData)
-
-saveRDS(
-  rmaData,
-  "resultados_GSE1009/GSE1009_RMA.rds"
-)
-
-# -----------------------------------------------------------------------------
-# 14. BOXPLOT RMA
-# -----------------------------------------------------------------------------
-
-pdf(
-  "resultados_GSE1009/figuras/02_boxplot_RMA.pdf",
-  width = 10,
-  height = 6
-)
-
-boxplot(
-  exprs(rmaData),
-  las = 2,
-  main = "GSE1009 - Após normalização RMA",
-  ylab = "Expressão log2",
-  outline = FALSE
-)
-
+png("04_Figuras/02_boxplot_depois_RMA.png", width = 1600, height = 1200, res = 200)
+boxplot(expr_sondas, col = cor_amostra, las = 2,
+        main = "Depois da normalização (RMA, log2)", ylab = "log2(expressão)")
 dev.off()
 
-# -----------------------------------------------------------------------------
-# 15. FILTRAGEM
-# -----------------------------------------------------------------------------
+# Sonda -> gene (Entrez); sondas sem gene são removidas; sondas do mesmo gene são promediadas
+id_entrez <- mapIds(hgu95av2.db, keys = rownames(expr_sondas), column = "ENTREZID",
+                    keytype = "PROBEID", multiVals = "first")
+manter    <- !is.na(id_entrez)
+expr_gene <- avereps(expr_sondas[manter, ], ID = id_entrez[manter])
+simbolos  <- mapIds(hgu95av2.db, keys = rownames(expr_gene), column = "SYMBOL",
+                    keytype = "ENTREZID", multiVals = "first")
 
-filtro <- nsFilter(
-  rmaData,
-  var.func = IQR,
-  var.cutoff = 0.5,
-  varByQuantile = TRUE,
-  feature.exclude = "^AFFX"
-)
-
-rma_filtrado <- filtro$eset
-
-saveRDS(
-  filtro,
-  "resultados_GSE1009/nsFilter_resultado.rds"
-)
-
-saveRDS(
-  rma_filtrado,
-  "resultados_GSE1009/GSE1009_RMA_filtrado.rds"
-)
-
-# -----------------------------------------------------------------------------
-# 16. MATRIZ
-# -----------------------------------------------------------------------------
-
-matriz_expr <- exprs(rma_filtrado)
-
-# -----------------------------------------------------------------------------
-# 17. PCA
-# -----------------------------------------------------------------------------
-
-pca <- prcomp(
-  t(matriz_expr),
-  center = TRUE,
-  scale. = FALSE
-)
-
-percent_PC <- 100 *
-  pca$sdev^2 /
-  sum(pca$sdev^2)
-
-pca_df <- data.frame(
-  Amostra = rownames(pca$x),
-  PC1 = pca$x[, 1],
-  PC2 = pca$x[, 2]
-)
-
-pca_df <- merge(
-  pca_df,
-  pheno[
-    ,
-    c(
-      "geo_accession",
-      "Grupo",
-      "Individuo_Bloco"
-    )
-  ],
-  by.x = "Amostra",
-  by.y = "geo_accession",
-  all.x = TRUE,
-  sort = FALSE
-)
-
-grafico_pca <- ggplot(
-  pca_df,
-  aes(
-    x = PC1,
-    y = PC2,
-    label = Amostra
-  )
-) +
+# PCA
+pca <- prcomp(t(expr_gene), scale. = FALSE)
+pct <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+df_pca <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2],
+                     amostra = info$amostra, grupo = info$grupo)
+p_pca <- ggplot(df_pca, aes(PC1, PC2, color = grupo, label = amostra)) +
   geom_point(size = 4) +
-  geom_text(vjust = -0.8) +
-  labs(
-    title = "PCA — GSE1009",
-    x = paste0(
-      "PC1 (",
-      round(percent_PC[1], 1),
-      "%)"
-    ),
-    y = paste0(
-      "PC2 (",
-      round(percent_PC[2], 1),
-      "%)"
-    )
-  ) +
-  theme_classic()
+  geom_text(vjust = -1, show.legend = FALSE) +
+  scale_color_manual(values = cores) +
+  labs(x = paste0("PC1 (", pct[1], "%)"), y = paste0("PC2 (", pct[2], "%)"),
+       color = "Grupo", title = "PCA - GSE1009") +
+  theme_bw()
+ggsave("04_Figuras/03_PCA.png", p_pca, width = 6, height = 5, dpi = 300)
 
-ggsave(
-  "resultados_GSE1009/figuras/03_PCA_PC1_PC2.pdf",
-  plot = grafico_pca,
-  width = 8,
-  height = 6
-)
+# 05. Análise diferencial (limma) ---------------------------------
+design <- model.matrix(~ grupo, data = info)     # log2FC = DN - Controle
+fit    <- eBayes(lmFit(expr_gene, design))
+tabela <- topTable(fit, coef = "grupoDN", number = Inf,
+                   adjust.method = "BH", sort.by = "P")
 
-saveRDS(
-  pca,
-  "resultados_GSE1009/PCA.rds"
-)
+# 06. Resultados ---------------------------------------------------
+tabela$ENTREZID <- rownames(tabela)
+tabela$SYMBOL   <- unname(simbolos[tabela$ENTREZID])
+tabela$regulacao <- "Nao_significativo"
+tabela$regulacao[tabela$adj.P.Val < fdr_corte & tabela$logFC >=  lfc_corte] <- "Aumentado"
+tabela$regulacao[tabela$adj.P.Val < fdr_corte & tabela$logFC <= -lfc_corte] <- "Reduzido"
+tabela <- tabela[, c("ENTREZID", "SYMBOL", "logFC", "AveExpr", "t",
+                     "P.Value", "adj.P.Val", "B", "regulacao")]
+deg <- tabela[tabela$regulacao != "Nao_significativo", ]
 
-# -----------------------------------------------------------------------------
-# 18. DESIGN
-# -----------------------------------------------------------------------------
+print(table(tabela$regulacao))
+write.csv(tabela, "05_Tabelas/tabela_completa_limma.csv", row.names = FALSE)
+write.csv(deg,    "05_Tabelas/genes_diferencialmente_expressos.csv", row.names = FALSE)
 
-grupo <- factor(
-  pheno$Grupo,
-  levels = c(
-    "Control",
-    "DN"
-  )
-)
+# 07. Gráficos ------------------------------------------------------
+# Volcano plot
+p_vulcao <- ggplot(tabela, aes(x = logFC, y = -log10(adj.P.Val), color = regulacao)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c(Aumentado = "#D7191C", Reduzido = "#2C7BB6",
+                                Nao_significativo = "grey70")) +
+  geom_vline(xintercept = c(-lfc_corte, lfc_corte), linetype = "dashed") +
+  geom_hline(yintercept = -log10(fdr_corte), linetype = "dashed") +
+  labs(x = "log2 Fold Change (DN vs Controle)", y = "-log10(FDR)",
+       color = "Regulação", title = "Volcano plot - GSE1009") +
+  theme_bw()
+ggsave("04_Figuras/04_volcano.png", p_vulcao, width = 7, height = 6, dpi = 300)
 
-design <- model.matrix(
-  ~ 0 + grupo
-)
+# Heatmap (até n_heatmap DEGs com menor FDR; z-score por gene)
+if (nrow(deg) < 2) stop("Menos de 2 DEGs: heatmap não pode ser feito. Ver seção 19 do POP.")
+deg_top <- head(deg, n_heatmap)                       # deg já está ordenado por p-valor
+mat <- expr_gene[deg_top$ENTREZID, , drop = FALSE]
+rownames(mat) <- make.unique(ifelse(is.na(deg_top$SYMBOL), deg_top$ENTREZID, deg_top$SYMBOL))
+anot_col <- data.frame(Grupo = info$grupo, row.names = info$amostra)
+pheatmap(mat, scale = "row",
+         annotation_col = anot_col, annotation_colors = list(Grupo = cores),
+         clustering_distance_rows = "euclidean", clustering_method = "complete",
+         main = "Heatmap dos DEGs - GSE1009",
+         filename = "04_Figuras/05_heatmap_DEGs.png", width = 7, height = 9)
 
-colnames(design) <- c(
-  "Control",
-  "DN"
-)
+# 08. Análise funcional (GO/KEGG) --------------------------------------
+if (nrow(deg) < 10) stop("Menos de 10 DEGs: análise funcional não recomendada. Ver seção 19 do POP.")
+genes_deg <- deg$ENTREZID          # genes de interesse (sem duplicatas)
+universo  <- tabela$ENTREZID       # universo = todos os genes testados
 
-# -----------------------------------------------------------------------------
-# 19. CONTRASTE
-# -----------------------------------------------------------------------------
+go <- enrichGO(gene = genes_deg, universe = universo, OrgDb = org.Hs.eg.db,
+               keyType = "ENTREZID", ont = "BP", pAdjustMethod = "BH",
+               pvalueCutoff = 0.05, qvalueCutoff = 0.05,
+               minGSSize = 10, maxGSSize = 500, readable = TRUE)
 
-contraste <- makeContrasts(
-  DN - Control,
-  levels = design
-)
+kegg <- enrichKEGG(gene = genes_deg, universe = universo, organism = "hsa",
+                   pAdjustMethod = "BH", pvalueCutoff = 0.05, qvalueCutoff = 0.05,
+                   minGSSize = 10, maxGSSize = 500)
+if (!is.null(kegg) && nrow(as.data.frame(kegg)) > 0)
+  kegg <- setReadable(kegg, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
 
-# -----------------------------------------------------------------------------
-# 20. CORRELAÇÃO INTRA-BLOCO
-# -----------------------------------------------------------------------------
+tem_go   <- !is.null(go)   && nrow(as.data.frame(go))   > 0
+tem_kegg <- !is.null(kegg) && nrow(as.data.frame(kegg)) > 0
 
-dupcor <- duplicateCorrelation(
-  matriz_expr,
-  design = design,
-  block = pheno$Individuo_Bloco
-)
-
-# -----------------------------------------------------------------------------
-# 21. MODELO
-# -----------------------------------------------------------------------------
-
-fit <- lmFit(
-  matriz_expr,
-  design = design,
-  block = pheno$Individuo_Bloco,
-  correlation = dupcor$consensus
-)
-
-fit_contraste <- contrasts.fit(
-  fit,
-  contrasts = contraste
-)
-
-fit_contraste <- eBayes(
-  fit_contraste
-)
-
-# -----------------------------------------------------------------------------
-# 22. RESULTADO LIMMA
-# -----------------------------------------------------------------------------
-
-resultado_limma <- topTable(
-  fit_contraste,
-  coef = 1,
-  number = Inf,
-  adjust.method = "BH",
-  sort.by = "P"
-)
-
-write.csv(
-  resultado_limma,
-  "resultados_GSE1009/limma_resultado_completo.csv"
-)
-
-saveRDS(
-  fit_contraste,
-  "resultados_GSE1009/limma_modelo.rds"
-)
-
-# -----------------------------------------------------------------------------
-# 23. ANOTAÇÃO
-# -----------------------------------------------------------------------------
-
-resultado_limma$PROBEID <- rownames(
-  resultado_limma
-)
-
-probe_ids <- resultado_limma$PROBEID
-
-anotacao <- AnnotationDbi::select(
-  hgu95av2.db,
-  keys = probe_ids,
-  columns = c(
-    "SYMBOL",
-    "ENTREZID"
-  ),
-  keytype = "PROBEID"
-)
-
-anotacao <- anotacao[
-  !duplicated(anotacao$PROBEID),
-  ,
-  drop = FALSE
-]
-
-resultado_anotado <- merge(
-  resultado_limma,
-  anotacao,
-  by = "PROBEID",
-  all.x = TRUE,
-  sort = FALSE
-)
-
-write.csv(
-  resultado_anotado,
-  "resultados_GSE1009/limma_resultado_anotado_por_sonda.csv",
-  row.names = FALSE
-)
-
-# -----------------------------------------------------------------------------
-# 24. CONSOLIDAÇÃO POR GENE
-# -----------------------------------------------------------------------------
-
-resultado_gene <- resultado_anotado[
-  !is.na(resultado_anotado$ENTREZID) &
-    resultado_anotado$ENTREZID != "",
-  ,
-  drop = FALSE
-]
-
-resultado_gene <- resultado_gene[
-  order(
-    resultado_gene$ENTREZID,
-    resultado_gene$P.Value
-  ),
-  ,
-  drop = FALSE
-]
-
-resultado_gene <- resultado_gene[
-  !duplicated(resultado_gene$ENTREZID),
-  ,
-  drop = FALSE
-]
-
-write.csv(
-  resultado_gene,
-  "resultados_GSE1009/limma_resultado_por_gene.csv",
-  row.names = FALSE
-)
-
-saveRDS(
-  resultado_gene,
-  "resultados_GSE1009/resultado_gene.rds"
-)
-
-# -----------------------------------------------------------------------------
-# 25. GENES SIGNIFICATIVOS
-# -----------------------------------------------------------------------------
-
-genes_significativos <- resultado_gene[
-  resultado_gene$adj.P.Val < 0.05 &
-    abs(resultado_gene$logFC) > 1,
-  ,
-  drop = FALSE
-]
-
-write.csv(
-  genes_significativos,
-  "resultados_GSE1009/genes_significativos.csv",
-  row.names = FALSE
-)
-
-# -----------------------------------------------------------------------------
-# 26. UPREGULATED
-# -----------------------------------------------------------------------------
-
-genes_up <- resultado_gene[
-  resultado_gene$adj.P.Val < 0.05 &
-    resultado_gene$logFC > 1,
-  ,
-  drop = FALSE
-]
-
-write.csv(
-  genes_up,
-  "resultados_GSE1009/genes_upregulated.csv",
-  row.names = FALSE
-)
-
-# -----------------------------------------------------------------------------
-# 27. IDs PARA GO
-# -----------------------------------------------------------------------------
-
-genes_up_entrez <- unique(
-  as.character(
-    na.omit(
-      genes_up$ENTREZID
-    )
-  )
-)
-
-universo_entrez <- unique(
-  as.character(
-    na.omit(
-      resultado_anotado$ENTREZID
-    )
-  )
-)
-
-# -----------------------------------------------------------------------------
-# 28. GO-BP
-# -----------------------------------------------------------------------------
-
-ego <- enrichGO(
-  gene = genes_up_entrez,
-  universe = universo_entrez,
-  OrgDb = org.Hs.eg.db,
-  keyType = "ENTREZID",
-  ont = "BP",
-  pAdjustMethod = "BH"
-)
-
-go_tabela <- as.data.frame(
-  ego
-)
-
-write.csv(
-  go_tabela,
-  "resultados_GSE1009/GO_BP_resultados.csv",
-  row.names = FALSE
-)
-
-saveRDS(
-  ego,
-  "resultados_GSE1009/GO_BP.rds"
-)
-
-# -----------------------------------------------------------------------------
-# 29. DOTPLOT
-# -----------------------------------------------------------------------------
-
-if (nrow(go_tabela) > 0) {
-
-  p_go <- dotplot(
-    ego,
-    showCategory = 10
-  )
-
-  ggsave(
-    "resultados_GSE1009/figuras/04_GO_BP_dotplot.pdf",
-    plot = p_go,
-    width = 10,
-    height = 7
-  )
+if (tem_go) {
+  p_go <- dotplot(go, showCategory = 15) + ggtitle("GO - Processos Biológicos")
+  ggsave("04_Figuras/06_GO_BP_dotplot.png", p_go, width = 8, height = 7, dpi = 300)
+}
+if (tem_kegg) {
+  p_kegg <- dotplot(kegg, showCategory = 15) + ggtitle("KEGG")
+  ggsave("04_Figuras/07_KEGG_dotplot.png", p_kegg, width = 8, height = 7, dpi = 300)
 }
 
-# -----------------------------------------------------------------------------
-# 30. SESSION INFO
-# -----------------------------------------------------------------------------
+# 09. Exportação ------------------------------------------------------
+expr_export <- cbind(ENTREZID = rownames(expr_gene),
+                     SYMBOL = unname(simbolos[rownames(expr_gene)]),
+                     as.data.frame(expr_gene))
+write.csv(expr_export, "03_Resultados/matriz_expressao_normalizada_genes.csv", row.names = FALSE)
+if (tem_go)   write.csv(as.data.frame(go),   "05_Tabelas/GO_BP_enriquecimento.csv",  row.names = FALSE)
+if (tem_kegg) write.csv(as.data.frame(kegg), "05_Tabelas/KEGG_enriquecimento.csv",   row.names = FALSE)
 
-writeLines(
-  capture.output(
-    sessionInfo()
-  ),
-  "resultados_GSE1009/sessionInfo.txt"
-)
+resumo <- data.frame(
+  parametro = c("genes_analisados", "DEGs_total", "DEGs_aumentados", "DEGs_reduzidos"),
+  valor = c(nrow(tabela), nrow(deg),
+            sum(tabela$regulacao == "Aumentado"), sum(tabela$regulacao == "Reduzido")))
+write.csv(resumo, "05_Tabelas/resumo_numeros.csv", row.names = FALSE)
 
-# -----------------------------------------------------------------------------
-# 31. RESUMO
-# -----------------------------------------------------------------------------
+writeLines(c(paste("Data da análise:", Sys.Date()),
+             paste("Bioconductor:", as.character(BiocManager::version())),
+             capture.output(sessionInfo())),
+           "06_Documentacao/sessionInfo.txt")
 
-resumo <- c(
-  "RESUMO DA ANALISE GSE1009",
-  "",
-  paste(
-    "Data de execução:",
-    Sys.time()
-  ),
-  paste(
-    "Número de arquivos CEL:",
-    length(cel_files)
-  ),
-  paste(
-    "Número de amostras:",
-    ncol(exprs(rmaData))
-  ),
-  paste(
-    "Probe sets após RMA:",
-    nrow(exprs(rmaData))
-  ),
-  paste(
-    "Probe sets após filtro:",
-    nrow(exprs(rma_filtrado))
-  ),
-  paste(
-    "Genes significativos:",
-    nrow(genes_significativos)
-  ),
-  paste(
-    "Genes upregulated:",
-    nrow(genes_up)
-  ),
-  paste(
-    "Genes no universo GO:",
-    length(universo_entrez)
-  ),
-  paste(
-    "Genes usados no GO:",
-    length(genes_up_entrez)
-  ),
-  paste(
-    "Termos GO-BP:",
-    nrow(go_tabela)
-  )
-)
 
-writeLines(
-  resumo,
-  "resultados_GSE1009/resumo_analise.txt"
-)
 
-# =============================================================================
-# FIM DO PIPELINE
-# =============================================================================
+# ==============================================================================
+# FIM DO SCRIPT
+# ==============================================================================
